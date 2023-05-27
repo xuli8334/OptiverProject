@@ -1,0 +1,918 @@
+---
+title: "Stock Volatility Analysis"
+author: "Optiver24"
+date: "2023-05-28"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(folding = TRUE)
+```
+
+# Stock Volatility Analysis
+
+------------------------------------------------------------------------
+
+## 1. Data Preparation
+
+Prepare the volatility data to be trained and tested.
+
+### 1.1 Import libraries
+
+Import packages to be used.
+
+```{r, eval=TRUE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(forecast)
+library(Metrics)
+library(rugarch)
+library(tseries)
+```
+
+### 1.2 Stock clustering
+
+We load a pre-defined clusters of stocks here. For the final submission, we selected a total of 45 stocks from 10 clusters. This results from the stock clustering file, `Advanced Volatility Clustering V2.Rmd`.
+
+```{r, eval=TRUE, results=FALSE}
+stocks_to_analyze <- get(load("stocks_to_analyze_df.RData"))
+group_lis <- split(stocks_to_analyze_df, stocks_to_analyze_df$cluster)
+selected_stocks <- stocks_to_analyze_df$stock_id
+selected_stocks
+```
+
+### 1.3 Define global variables
+
+Define the important global variables to be used in the project here to change the settings easily.
+
+```{r, eval=TRUE}
+# Global variables
+SECOND.PER.BUCKET <- 10 # number of seconds per time bucket
+stock_ids <- as.character(selected_stocks)
+num.stocks <- length(stock_ids)
+stock_data_dir <- "individual_book_train"
+cached_data_dir <- "cached_data/"
+num.time.id <- 500 # number of time ids to be analysed
+```
+
+------------------------------------------------------------------------
+
+## 2. Volatility calculation
+
+> As it may take large amount of computational time and space, you can skip this section and load cached `.RData` file for volatility directly at [2.3 Cached volatility data].
+
+Import stock files of the selected stocks to environment.
+
+```{r, results='hide'}
+# Take a list of stock numbers, return a list of stock dataframe
+load_stocks <- function(path, selected_stocks){
+  stock.dic <- list()
+  for (i in selected_stocks){
+    filepath <- paste0(path, "/stock_", i, ".csv")
+    print(filepath)
+    stock <- read.csv(filepath)
+    stock.dic[[i]] <- stock
+  }
+  return(stock.dic)
+}
+stock.dic.raw <- load_stocks(stock_data_dir, stock_ids)
+```
+
+### 2.1 Compute statistics from order book
+
+Compute weighted average price (WAP), BidAskSpread, and the time bucket for all the snapshots over the selected stocks.
+
+```{r}
+compute_stats <- function(stock){
+  stock <- stock %>% mutate(WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+  stock <- stock %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+  stock <- stock %>% mutate(time_bucket = ceiling(seconds_in_bucket / SECOND.PER.BUCKET))
+  return(stock)
+}
+
+stock.dic <- list()
+for (stock_id in stock_ids){
+  print(paste0("Computing stats for stock_", stock_id))
+  stock.dic[[stock_id]] <- compute_stats(stock.dic.raw[[stock_id]])
+}
+```
+
+### 2.2 Compute log returns and realised volatility
+
+Define a function to compute log returns which takes a stock dataframe and selected time ids as input and returns a list of log-return dataframes for each time_ID.
+
+```{r, results='hide'}
+# Compute the log returns for the first n 10-min time intervals 
+get_log_returns <- function(stock, num_time_id, time_IDs){
+  log_r1 <- list()
+  for (i in 1 : length(time_IDs)) {
+    sec <- stock %>% filter(time_id == time_IDs[i]) %>% pull(seconds_in_bucket)
+    price <- stock %>% filter(time_id == time_IDs[i]) %>% pull(WAP)
+    log_r <- log(price[-1] / price[1:(length(price) - 1)])
+    log_r1[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+    time.no.change <- (1:600)[!(1:600 %in% log_r1[[i]]$time)]
+    if (length(time.no.change) > 0) {
+      new.df <- data.frame(time = time.no.change, log_return = 0)
+      log_r1[[i]] <- rbind(log_r1[[i]], new.df)
+      log_r1[[i]] <- log_r1[[i]][order(log_r1[[i]]$time), ]
+    }
+  }
+  return(log_r1)
+}
+
+```
+
+Find first 500 common time_ids of selected stocks.
+
+```{r, echo=FALSE}
+comm_time_IDs <- unique(stock.dic[[1]][, 1])
+for (k in 2 : length(stock.dic)) {
+  comm_time_IDs <- intersect(comm_time_IDs, unique(stock.dic[[k]][, 1]))
+}
+comm_time_IDs <- comm_time_IDs[1:num.time.id]
+```
+
+Compute log returns for the first 500 time IDs. Then, compute the realised volatility based on log returns where volatility is calculated in every 10 seconds
+
+```{r, results='hide'}
+# 
+comp_vol <- function(x) {
+  return(sqrt(sum(x ^ 2)))
+}
+get_vol <- function(log_r1){
+  vol <- list()
+  for (i in 1 : length(log_r1)) {
+    log_r1[[i]] <- log_r1[[i]] %>% mutate(time_bucket = ceiling(time / SECOND.PER.BUCKET))
+    vol[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_vol)
+    colnames(vol[[i]]) <- c('time_bucket', 'volatility')
+  }
+  return(vol)
+}
+
+log.return.dic <- list() # a dictionary-like list containing log-return dataframes for stocks
+for (stock_id in stock_ids){
+  print(paste0("Compute log returns for stock_", stock_id))
+  log.return.dic[[stock_id]]  <- get_log_returns(stock.dic[[stock_id]], num.time.id, comm_time_IDs)
+}
+
+vol.dic <- list() # a dictionary-like list containing volatility dataframes for 10 stocks
+for (stock_id in stock_ids){
+  print(paste0("Compute volatility for stock_", stock_id))
+  vol.dic[[stock_id]] <- get_vol(log.return.dic[[stock_id]] )
+}
+```
+
+Find the length of a volatility data.
+
+```{r}
+len.vol <- length(vol.dic[[1]][[1]]$volatility)
+```
+
+### 2.3 Cached volatility data
+
+Load pre-computed volatility data.
+
+```{r, eval=TRUE}
+vol.dic <- get(load(paste0(cached_data_dir, "vol_dic.RData")))
+len.vol <- length(vol.dic[[1]][[1]]$volatility)
+
+comm_time_IDs <- get(load(paste0(cached_data_dir, "comm_time_IDs.RData")))
+```
+
+### 2.4 Volatility visualisation
+
+```{r, eval=TRUE}
+ggplot(data = vol.dic[[1]][[1]], aes(x = time_bucket, y = volatility)) + geom_line() + geom_point() 
+```
+
+------------------------------------------------------------------------
+
+## 3. Volatility Prediction
+
+> To skip the training and predicting processes, you can load cached predictions at [3.7 Cached trained models and predictions]
+
+### 3.1 Autocorrelation
+
+Conduct a preliminary analysis on the autocorrelation function (ACF) of the time series on realised volatility. The first selected stock at the first time ID is used.
+
+```{r}
+acf(vol.dic[[1]][[1]]$volatility, main = "ACF plot for realised volatility")
+```
+
+PACF plot.
+
+```{r}
+pacf(vol.dic[[1]][[1]]$volatility, main = "PACF plot for realised volatility")
+```
+
+### 3.2 Train-test split
+
+Split the volatility data by 80% for training and 20% for testing, i.e. the first 8 minutes of time series data at a time ID used to fit the model and the rest 2 minutes are used to validate the prediction made by models.
+
+```{r}
+vol.train.dic <- list()
+vol.val.dic <- list()
+
+n_start <- ceiling(nrow(vol.dic[[1]][[1]]) * 0.8)
+
+for (stock_id in stock_ids) {
+  vol.train.dic[[stock_id]] <- list()
+  vol.val.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    vol.train.dic[[stock_id]][[i]] <- vol.dic[[stock_id]][[i]][1:n_start, ]
+    vol.val.dic[[stock_id]][[i]] <- vol.dic[[stock_id]][[i]][-(1:n_start), ]
+  }
+}
+len.train <- length(vol.train.dic[[1]][[1]]$volatility)
+len.val <- length(vol.val.dic[[1]][[1]]$volatility)
+```
+
+***Cached training data and testing data.***
+
+```{r, eval=TRUE}
+vol.train.dic <- get(load(paste0(cached_data_dir, "vol_train_dic.RData")))
+vol.val.dic <- get(load(paste0(cached_data_dir, "vol_val_dic.RData")))
+len.train <- length(vol.train.dic[[1]][[1]]$volatility)
+len.val <- length(vol.val.dic[[1]][[1]]$volatility)
+```
+
+### 3.3 Assumption checking for time series data
+
+```{r, eval=TRUE}
+# Assume `vol.train.dic` is your time-series data
+tsdata <- vol.train.dic[[1]][[1]]$volatility
+
+# Augmented Dickey-Fuller test for stationarity
+adf.test(tsdata)
+
+# Ljung-Box test for autocorrelation in residuals
+Box.test(tsdata, type = "Ljung-Box")
+
+# KPSS test for order of differencing
+kpss.test(tsdata)
+
+# Engle's ARCH test for constant variance
+# rugarch::arch.test(tsdata)
+```
+
+### 3.4 ARIMA
+
+Fit ARIMA model with order(0, 0, 10).
+
+```{r, results='hide'}
+# Train
+arima.model.dic <- list() # contains arima models
+for (stock_id in stock_ids) {
+  print(paste0("Training ARIMA with stock_", stock_id))
+  arima.model.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    train_data <- vol.train.dic[[stock_id]][[i]]$volatility
+    arima.model.dic[[stock_id]][[i]] <- arima(train_data, order = c(0, 0, 10))
+    # auto.arima(train_data, ic = "aic")
+    # can try run with defined orders here, such as `arima(train_data, order=c(1,0,1))`, compare performance metrices
+  }
+}
+```
+
+Apply ARIMA model to predict volatility.
+
+```{r, results='hide'}
+# Predict
+arima.pred.dic <- list()
+for (stock_id in stock_ids) {
+  print(paste0("Using ARIMA predict stock_", stock_id))
+  arima.pred.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    model <- arima.model.dic[[stock_id]][[i]]
+    arima.pred.dic[[stock_id]][[i]] <- (forecast(model, h = len.val)$mean)
+  }
+}
+```
+
+### 3.5 Linear regression model
+
+#### 3.5.1 Traing set set preparation
+
+Add features for linear regression, i.e. imbalance, number of orders.
+
+```{r}
+reg.stock.dic <- list()
+for (stock_id in stock_ids){
+  stock <- stock.dic[[stock_id]]
+  stock <- stock %>% mutate(num_order = bid_size1 + ask_size1 + bid_size2 + ask_size2)
+  stock <- stock %>% mutate(imbalance = ((bid_size1 + bid_size2) - (ask_size1 + ask_size2))/ num_order )
+  reg.stock.dic[[stock_id]] <- stock
+}
+```
+
+For all selected stocks and all 500 time_IDs, construct a data frame for training and validation. For each 10-sec time buckect, we compute the `mean.price`, `mean.order`, `mean.BAS`, `mean.imbalance`, `sd.price`, `sd.BAS`, and `sd.imbalance`.
+
+```{r, results='hide'}
+# construct training set and validation set for linear regression
+reg.train.dic <- list()
+reg.val.dic <- list()
+
+for (stock_id in stock_ids) {
+  print(paste0("Processing on stock_", stock_id))
+  
+  # retrieve vol table and stock table from dictionaries
+  stock <- reg.stock.dic[[stock_id]]
+  vol.train <- vol.train.dic[[stock_id]]
+  vol.val <- vol.val.dic[[stock_id]]
+  
+  # initialise the stock_id of 500 regression training sets for stock `stock_id`
+  reg.train.dic[[stock_id]] <- list()
+  reg.val.dic[[stock_id]] <- list()
+  
+  for (i in 1 : num.time.id) { 
+    stats.bucket <- stock %>% 
+      filter(time_id == comm_time_IDs[i] & time_bucket != 0) %>% 
+      dplyr::select(c(BidAskSpread, WAP, num_order, time_bucket, imbalance))
+    
+    # For each 10-sec time bucket, we compute the following statistics.
+    mean.price <- aggregate(WAP ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.order <- aggregate(num_order ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.BAS <- aggregate(BidAskSpread ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.imbalance <- aggregate(imbalance ~ time_bucket, data = stats.bucket, FUN = mean)
+    sd.price <- aggregate(WAP ~ time_bucket, data = stats.bucket, FUN = sd)
+    sd.BAS <- aggregate(BidAskSpread ~ time_bucket, data = stats.bucket, FUN = sd)
+    sd.imbalance <- aggregate(imbalance ~ time_bucket, data = stats.bucket, FUN = sd)
+    
+    # Replace NA values with 0
+    sd.price$WAP[is.na(sd.price$WAP)] <- 0 
+    sd.BAS$BidAskSpread[is.na(sd.BAS$BidAskSpread)] <- 0 
+    sd.imbalance$imbalance[is.na(sd.imbalance$imbalance)] <- 0 
+    
+    # Data frame for training set
+    train.idx <- 1:(len.train - 1)
+    train.df <- data.frame(volatility = vol.train[[i]]$volatility[-1],
+                                price = mean.price$WAP[train.idx],
+                                order = mean.order$num_order[train.idx],
+                                BidAskSpread = mean.BAS$BidAskSpread[train.idx],
+                                imbalance = mean.imbalance$imbalance[train.idx],
+                                priceSD = sd.price$WAP[train.idx],
+                                spreadSD = sd.BAS$BidAskSpread[train.idx],
+                                imbalanceSD = sd.imbalance$imbalance[train.idx])
+    # Data frame for validation set
+    val.idx <- len.train:(len.train + len.val - 1)
+    val.df <- data.frame(volatility = vol.val[[i]]$volatility, 
+               price = mean.price$WAP[val.idx],
+               order = mean.order$num_order[val.idx],
+               BidAskSpread = mean.BAS$BidAskSpread[val.idx],
+               imbalance = mean.imbalance$imbalance[val.idx],
+               priceSD = sd.price$WAP[val.idx],
+               spreadSD = sd.BAS$BidAskSpread[val.idx],
+               imbalanceSD = sd.imbalance$imbalance[val.idx])
+    
+    # Assign the dataframes to the list
+    reg.train.dic[[stock_id]][[i]] <- train.df
+    reg.val.dic[[stock_id]][[i]] <- val.df
+  }
+}
+
+```
+
+Combine the training sets of 500 time IDs into one dataframe.
+
+```{r, results='hide'}
+# Reconstruct training set
+reg.train.dic.1 <- list()
+for (stock_id in stock_ids) {
+  print(paste0("Processing at stock_", stock_id))
+  df <- data.frame(matrix(ncol = 8, nrow = 0))
+  colnames(df) <- c("volatility", "price", "order", "BidAskSpread", "imbalance", "priceSD", "spreadSD", "imbalanceSD")
+  for (i in 1 : num.time.id) {
+    df <- rbind(df, reg.train.dic[[stock_id]][[i]])
+  }
+  reg.train.dic.1[[stock_id]] <- df
+}
+```
+
+#### 3.5.2 Model fitting and prediction
+
+Cached data for training and predicting for linear regression model.
+
+```{r, eval=TRUE}
+reg.val.dic <- get(load(paste0(cached_data_dir, "reg_val_dic.RData")))
+reg.train.dic.1 <- get(load(paste0(cached_data_dir, "reg_train_dic_1.RData")))
+```
+
+Training step. Fit linear models.
+
+```{r,echo=FALSE, results='hide'}
+# Train
+linear.model.dic.1 <- list() 
+for (stock_id in stock_ids) {
+  print(paste0("Training lm on stock_", stock_id))
+  linear.model.dic.1[[stock_id]] <- lm(volatility ~ price + order + BidAskSpread + imbalance + priceSD + spreadSD + imbalanceSD, reg.train.dic.1[[stock_id]])
+}
+```
+
+*Linear model assumption checking.*
+
+```{r, results='hide'}
+# # Assume `vol.train.dic` is your regression model
+mod1 <- linear.model.dic.1[[1]]
+
+# Durbin-Watson test for independence
+library(car)
+durbinWatsonTest(mod1)
+
+# library(lmtest)
+# # Breusch-Pagan test for homoscedasticity
+# lmtest::bptest(mod1)
+
+# Shapiro-Wilk test for normality of residuals
+shapiro.test(resid(mod1))
+
+```
+
+```{r}
+lm1 <- linear.model.dic.1[[10]]
+par(mfrow=c(1,2))
+plot(lm1, which=c(1,2))
+
+```
+
+Linear model prediction.
+
+```{r}
+# Predict
+reg.pred.dic.1 <- list()
+for (stock_id in stock_ids) {
+  print(paste0("Predicting stock_", stock_id, " volatility using lm"))
+  reg.pred.dic.1[[stock_id]] <- list()
+  model <- linear.model.dic.1[[stock_id]]
+  for (i in 1 : num.time.id) {
+    val.data <- reg.val.dic[[stock_id]][[i]]
+    pred <- predict(model, newdata = val.data)
+    pred[is.na(pred)] <- 0 
+    reg.pred.dic.1[[stock_id]][[i]] <- pred
+  }
+}
+```
+
+### 3.6 HAV-RV model
+
+Construct HAV-RV training set.
+
+```{r, results='hide'}
+hav.train.dic <- list()
+for (stock_id in stock_ids) {
+  print(paste0("Construct HAV training set for stock ", stock_id))
+  # Initialise a list containing HAV training dataframe for stock at stock_id
+  hav.train.dic[[stock_id]] <- list()
+  # Retrieve the training volatility set for stock at stock_id
+  vol.train <- vol.train.dic[[stock_id]]
+  # how many lagged time buckets are used to take the mean as predictor
+  mean_lag <- 5
+  for (i in 1 : num.time.id) {
+    # compute the mean vol for previous 5 time buckets
+    mean.vol <- rep(0, len.train - mean_lag)
+    for (j in 1 : mean_lag) {
+      mean.vol <- mean.vol + vol.train[[i]]$volatility[j : (j + len.train - mean_lag - 1)] / mean_lag
+    }
+    hav.train.dic[[stock_id]][[i]] <- data.frame(vol = vol.train[[i]]$volatility[-(1:mean_lag)], 
+                                vol_1 = vol.train[[i]]$volatility[mean_lag:(len.train - 1)],
+                                mean_vol_5 = mean.vol)
+  }
+}
+```
+
+HAV-RV training step.
+
+```{r, results='hide'}
+# Train HAV model
+hav.model.dic <- list() 
+for (stock_id in stock_ids) {
+  print(paste0("Fitting HAV model for stock_", stock_id))
+  hav.model.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    train_data <- hav.train.dic[[stock_id]][[i]]
+    hav.model <- lm(vol ~ vol_1 + mean_vol_5, train_data)
+    hav.model.dic[[stock_id]][[i]] <- hav.model
+  }
+}
+```
+
+HAV-RV prediction step.
+
+```{r, results='hide'}
+# Define a forecast function for HAV-RV model
+# vol_set = hav.train.dic[[1]][[1]] for example
+hav_forecast <- function(model, vol_set, h=len.val) {
+  ret <- vector()
+  vol_vec <- vol_set$vol
+  
+  # how many lagged time buckets to take the mean
+  mean_lag <- 5
+  
+  for (i in 1: h) {
+    lag1_vol <- vol_vec[length(vol_vec)]
+    lag5_vol_mean <- mean(vol_vec[(length(vol_vec) - mean_lag + 1): length(vol_vec)])
+    lagged_df <- data.frame(
+      vol_1 = lag1_vol,
+      mean_vol_5 = lag5_vol_mean
+    )
+    pred <- predict(model, lagged_df)
+    ret <- c(ret, pred)
+    vol_vec <- c(vol_vec, pred)
+  }
+  return(ret)
+}
+
+# Predict HAV-RV
+hav.pred.dic <- list()
+for (stock_id in stock_ids) {
+  print(paste0("Using HAV-RV predict stock_", stock_id))
+  hav.pred.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    model <- hav.model.dic[[stock_id]][[i]]
+    vol_set <- hav.train.dic[[stock_id]][[i]]
+    hav.pred.dic[[stock_id]][[i]] <- hav_forecast(model, vol_set)
+  }
+}
+```
+
+### 3.7 ARMA-GARCH
+
+```{r, warning=FALSE, results='hide'}
+# Train
+library(rugarch)
+garch.model.dic <- list() # contains garch models
+for (stock_id in stock_ids) {
+  print(paste0("Fitting GARCH at stock_", stock_id))
+  vol.train.lis <- vol.train.dic[[stock_id]]
+  garch.model.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    train_data <- vol.train.lis[[i]]$volatility
+    spec = ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                      mean.model = list(armaOrder = c(1, 1)), 
+                      distribution.model = "norm")
+    garch.model.dic[[stock_id]][[i]] <- ugarchfit(spec, train_data, solver = 'hybrid')
+  }
+}
+
+# Predict
+garch.pred.dic <- list()
+for (stock_id in stock_ids) {
+  print(paste0("Predicting GARCH for stock_", stock_id))
+  garch.pred.dic[[stock_id]] <- list()
+  for (i in 1 : num.time.id) {
+    model <- garch.model.dic[[stock_id]][[i]]
+    garch.pred.dic[[stock_id]][[i]] <- fitted(ugarchforecast(model, n.ahead = len.val))
+  }
+}
+```
+
+### 3.7 Cached trained models and predictions
+
+Cached models.
+
+```{r, eval=TRUE}
+arima.model.dic <- get(load(paste0(cached_data_dir, "arima_model_dic.RData")))
+linear.model.dic.1 <- get(load(paste0(cached_data_dir, "linear_model_dic.RData")))
+hav.model.dic <- get(load(paste0(cached_data_dir, "hav_model_dic.RData")))
+garch.model.dic <- get(load(paste0(cached_data_dir, "garch_model_dic.RData")))
+```
+
+Cached predictions.
+
+```{r, eval=TRUE}
+arima.pred.dic <- get(load(paste0(cached_data_dir, "arima_pred_dic.RData")))
+reg.pred.dic.1 <- get(load(paste0(cached_data_dir, "reg_pred_dic.RData")))
+hav.pred.dic <- get(load(paste0(cached_data_dir, "hav_pred_dic.RData")))
+garch.pred.dic <- get(load(paste0(cached_data_dir, "garch_pred_dic.RData")))
+```
+
+------------------------------------------------------------------------
+
+## 4. Evaluation
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE)
+```
+
+### 4.1 Prediction visualisation
+
+Define a function that plot the predicted volatility and actual volatility based on a stock id and a time id.
+
+```{r, eval=TRUE}
+draw_res_plot <- function(arima.pred.dic, reg.pred.dic, hav.pred.dic, garch.pred.dic, stock_id, time_id){
+  actual.train.df <- vol.train.dic[[stock_id]][[time_id]]
+  actual.val.df <- vol.val.dic[[stock_id]][[time_id]]
+  actual.vol.df <- vol.dic[[stock_id]][[time_id]]
+  
+  pred_vol_0 <- actual.train.df[len.train,]$volatility # last volatility of the first predicted one
+  
+  arima.pred.df <- data.frame(
+    time_bucket = c(len.train: len.vol),
+    pred_vol = c(pred_vol_0, as.numeric(arima.pred.dic[[stock_id]][[time_id]]))
+  )
+  
+  reg.pred.df <- data.frame(
+    time_bucket = c(len.train: len.vol),
+    pred_vol = c(pred_vol_0, reg.pred.dic[[stock_id]][[time_id]])
+  )
+  
+  hav.pred.df <- data.frame(
+    time_bucket = c(len.train: len.vol),
+    pred_vol = c(pred_vol_0, hav.pred.dic[[stock_id]][[time_id]])
+  )
+  
+  garch.pred.df <- data.frame(
+    time_bucket = c(len.train: len.vol),
+    pred_vol = c(pred_vol_0, garch.pred.dic[[stock_id]][[time_id]])
+  )
+  
+  plot <- ggplot(data = actual.vol.df, aes(x = time_bucket,
+                                    y = volatility,
+                                    color = "Actual Volatility")) +
+  geom_line() +
+  geom_line(data = reg.pred.df, aes(x = time_bucket,y = pred_vol, color = "Regression prediction")) +
+  geom_line(data = arima.pred.df, aes(x = time_bucket,y = pred_vol, color = "ARIMA prediction")) +
+  geom_line(data = hav.pred.df, aes(x = time_bucket,y = pred_vol, color = "HAV prediction")) +
+  geom_line(data = garch.pred.df, aes(x = time_bucket,y = pred_vol, color = "GARCH prediction")) +
+  geom_vline(xintercept = len.train, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c(
+    "Actual Volatility" = "black", "ARIMA prediction" = "orange", "Regression prediction" = "blue", "HAV prediction" = "green", "GARCH prediction" = "red")) +
+  ggtitle(paste0("Actual vs Predicted Volatility for Stock ID ", stock_id, " at time ID ", time_id)) +
+  xlab("Time bucket") +
+  ylab("Volatility")
+  print(plot)
+}
+```
+
+Visualise the predictions of the first 5 stocks at time ID 5.
+
+```{r, eval=TRUE}
+for (i in 1 : 5){
+  stock_idx = i
+  time_idx = 1 # pick time id here
+  time_id <- comm_time_IDs[[time_idx]]
+  draw_res_plot(arima.pred.dic, reg.pred.dic.1, hav.pred.dic, garch.pred.dic, stock_idx, time_id)
+}
+```
+
+### 4.2 Model evaluation
+
+Define a `evaluate()` function. Take validation data and prediction data as input. Return a list of measurements containing "MSE", "RMSE", "MAE", "QLIKE".
+
+```{r, eval=TRUE}
+evaluate <- function(val.dic, pred.dic) {
+  mse.dic <- list()
+  rmse.dic <- list()
+  mae.dic <- list()
+  qlike.dic <- list()
+  
+  for (stock_id in stock_ids) {
+    # Initialise a vector to store the metrices for each time id
+    mse.vec <- rep(0, num.time.id)
+    rmse.vec <- rep(0, num.time.id)
+    mae.vec <- rep(0, num.time.id)
+    qlike.vec <- rep(0, num.time.id)
+    
+    for (i in 1 : num.time.id) {
+      pred <- pred.dic[[stock_id]][[i]]
+      actual <- val.dic[[stock_id]][[i]]$volatility
+      mse.vec[[i]] <- mse(actual, pred)
+      rmse.vec[[i]] <- rmse(actual, pred)
+      mae.vec[[i]] <- mae(actual, pred)
+      qlike.vec[[i]] <- mean(actual/pred - log(actual/pred) - 1)
+    }
+    
+    mse.dic[[stock_id]] <- mse.vec
+    rmse.dic[[stock_id]] <- rmse.vec
+    mae.dic[[stock_id]] <- mae.vec
+    qlike.dic[[stock_id]] <- qlike.vec[is.finite(qlike.vec)]
+  }
+  return(list("MSE"=mse.dic, "RMSE"=rmse.dic, "MAE"=mae.dic, "QLIKE"=qlike.dic))
+}
+```
+
+```{r, eval=TRUE}
+# Convert the list of metrices to a dataframe (this is only for better showing the performance of one model in each stock)
+get_metric_df <- function(res){
+  ret_df <- data.frame(matrix(ncol = 5, nrow = 0))
+  colnames(ret_df) <- c("MSE", "RMSE", "MAE", "QLIKE", "RMSE_sd")
+  for (stock_id in stock_ids) {
+    stock_mse <- mean(na.omit(unlist(res[[1]][[stock_id]])))
+    stock_rmse <- mean(na.omit(unlist(res[[2]][[stock_id]])))
+    stock_rmse_sd <- sd(na.omit(unlist(res[[2]][[stock_id]])))
+    stock_mae <- mean(na.omit(unlist(res[[3]][[stock_id]])))
+    qlike_lis <- na.omit(unlist(res[[4]][[stock_id]])) # Too many NA and Inf values for qlike, could have better approaches rather than just cleaning it
+    stock_qlike <- mean(qlike_lis[is.finite(qlike_lis)])
+    stock_df <- data.frame(MSE = stock_mse, RMSE = stock_rmse, MAE = stock_mae, QLIKE = stock_qlike, RMSE_sd = stock_rmse_sd)
+    rownames(stock_df) <- (stock_id)
+    ret_df <- rbind(ret_df, stock_df)
+  }
+  return(ret_df)
+}
+```
+
+#### 4.2.1 ARIMA evaluation
+
+```{r, warning = FALSE, eval=TRUE}
+arima_res <- evaluate(vol.val.dic, arima.pred.dic)
+arima_df <- get_metric_df(arima_res)
+colMeans(arima_df)
+```
+
+#### 4.2.2 Linear Regression evaluation
+
+```{r, warning = FALSE, eval=TRUE}
+reg_res_1 <- evaluate(vol.val.dic, reg.pred.dic.1)
+reg_df_1 <- get_metric_df(reg_res_1)
+colMeans(reg_df_1)
+```
+
+#### 4.2.3 HAV evaluation
+
+```{r, warning = FALSE, eval=TRUE}
+hav_res <- evaluate(vol.val.dic, hav.pred.dic)
+hav_df <- get_metric_df(hav_res)
+colMeans(hav_df)
+```
+
+#### 4.2.4 GARCH evaluation
+
+```{r, warning = FALSE, eval=TRUE}
+garch_res <- evaluate(vol.val.dic, garch.pred.dic)
+garch_df <- get_metric_df(garch_res)
+colMeans(garch_df)
+```
+
+### 4.3 Model performance comparison across stocks
+
+```{r, eval=TRUE}
+# Compare the model performance at each stock using MSE
+plot_performance <- function(arima_res, reg_res, hav_res, garch_res, stock_id, method_type="RMSE") {
+  methods <- list("MSE" = 1, "RMSE" = 2, "MAE" = 3, "QLIKE" = 4)
+  method_idx <- methods[[method_type]]
+  arima_1 <- (unlist(arima_res[[method_idx]][[stock_id]]))
+  reg_1 <- (unlist(reg_res_1[[method_idx]][[stock_id]]))
+  hav_1 <- (unlist(hav_res[[method_idx]][[stock_id]]))
+  garch_1 <- (unlist(garch_res[[method_idx]][[stock_id]]))
+  
+  # Combine the vectors into a list
+  vectors <- list(arima_1, reg_1, hav_1, garch_1)
+  names(vectors) = c("ARIMA", "Linear Regression", "HAV-RV", "GARCH")
+  
+  # Calculate means for each vector
+  vector_means <- sapply(vectors, mean)
+  
+  # Identify the index of the lowest mean
+  lowest_mean_idx <- which.min(vector_means)
+  
+  boxplot(vectors, 
+          names = names(vectors), 
+          col = ifelse(names(vectors) == names(vectors)[lowest_mean_idx], "red", "gray"),
+          main = paste0("Models performance at stocks ", stock_id), 
+          ylab = method_type,
+          outline = FALSE)
+}
+
+```
+
+```{r, eval=TRUE}
+for (i in 1 : 5){
+  plot_performance(arima_res, reg_res_1, hav_res, garch_res, i, "RMSE") 
+}
+```
+
+### 4.4 Model performance comparison across clusters(classes) (RMSE)
+
+```{r, message=TRUE, eval=TRUE}
+rmse_eval_table <- data.frame(matrix(ncol = 4, nrow = 0))
+colnames(rmse_eval_table) <- c("ARIMA", "Regression", "HAV_RV", "ARMA_GARCH")
+for (group in group_lis) {
+  stocks <- as.character(group$stock_id)
+  arima_rmse <- c()
+  reg_rmse <- c()
+  hav_rmse <- c()
+  garch_rmse <- c()
+  for (stock_id in stocks) {
+    arima_rmse <- c(arima_rmse, arima_res[[2]][[stock_id]])
+    reg_rmse <- c(reg_rmse, reg_res_1[[2]][[stock_id]])
+    hav_rmse <- c(hav_rmse, hav_res[[2]][[stock_id]])
+    garch_rmse <- c(garch_rmse, garch_res[[2]][[stock_id]])
+  }
+  row_df <- data.frame("ARIMA" = mean(arima_rmse, na.rm = TRUE), 
+                       "Regression" = mean(reg_rmse, na.rm = TRUE), 
+                       "HAV_RV" = mean(hav_rmse, na.rm = TRUE), 
+                       "ARMA_GARCH" = mean(garch_rmse, na.rm = TRUE))
+  rownames(row_df) <- paste0("Cluster", as.character(group$cluster[1]))
+  rmse_eval_table <- rbind(rmse_eval_table, row_df)
+}
+rmse_eval_table
+```
+
+### 4.5 Model comparison with different metrics over predictions made by all trained stocks
+
+Calculate RMSE(mean), RMSE(sd), QLIKE(mean) for four models over all predictions.
+
+```{r, eval=TRUE}
+arima_rmse <- unlist(arima_res[[2]])
+reg_rmse <- unlist(reg_res_1[[2]])
+hav_rmse <- unlist(hav_res[[2]])
+garch_rmse <- unlist(garch_res[[2]])
+
+arima_mae <- unlist(arima_res[[3]])
+reg_mae <- unlist(reg_res_1[[3]])
+hav_mae <- unlist(hav_res[[3]])
+garch_mae <- unlist(garch_res[[3]])
+
+arima_qlike <- unlist(arima_res[[4]])
+reg_qlike <- unlist(reg_res_1[[4]])
+hav_qlike <- unlist(hav_res[[4]])
+garch_qlike <- unlist(garch_res[[4]])
+
+arima_rmse_mean <- mean(arima_rmse, na.rm = TRUE)
+reg_rmse_mean <- mean(reg_rmse, na.rm = TRUE)
+hav_rmse_mean <- mean(hav_rmse, na.rm = TRUE)
+garch_rmse_mean <- mean(garch_rmse, na.rm = TRUE)
+
+arima_rmse_sd <- sd(arima_rmse, na.rm = TRUE)
+reg_rmse_sd <- sd(reg_rmse, na.rm = TRUE)
+hav_rmse_sd <- sd(hav_rmse, na.rm = TRUE)
+garch_rmse_sd <- sd(garch_rmse, na.rm = TRUE)
+
+arima_qlike_mean <- mean(arima_qlike, na.rm = TRUE)
+reg_qlike_mean <- mean(reg_qlike, na.rm = TRUE)
+hav_qlike_mean <- mean(hav_qlike, na.rm = TRUE)
+garch_qlike_mean <- mean(garch_qlike, na.rm = TRUE)
+
+metrics_df <- data.frame(
+  "RMSE(mean)" = c(arima_rmse_mean, reg_rmse_mean, hav_rmse_mean, garch_rmse_mean),
+  "RMSE(sd)" = c(arima_rmse_sd, reg_rmse_sd, hav_rmse_sd, garch_rmse_sd),
+  "QLIKE(mean)" = c(arima_qlike_mean, reg_qlike_mean, hav_qlike_mean, garch_qlike_mean)
+)
+rownames(metrics_df) <- c("ARIMA", "Linear.Regression", "HAV.RV", "ARMA.GARCH")
+```
+
+Calculate AIC(mean).
+
+```{r, eval=TRUE}
+arima_aic_vec <- c()
+reg_aic_vec <- c()
+hav_aic_vec <- c()
+garch_aic_vec <- c()
+for (stock_id in stock_ids) {
+  for (i in 1: num.time.id) {
+    arima_aic_vec <- c(arima_aic_vec, AIC(arima.model.dic[[stock_id]][[i]]))
+    hav_aic_vec <- c(hav_aic_vec, AIC(hav.model.dic[[stock_id]][[i]]))
+    garch_aic_vec <- c(garch_aic_vec, infocriteria(garch.model.dic[[stock_id]][[i]])[1])
+  }
+  reg_aic_vec <- c(reg_aic_vec, AIC(linear.model.dic.1[[stock_id]]))
+}
+metrics_df$AIC.mean. <- c(mean(arima_aic_vec), mean(reg_aic_vec), mean(hav_aic_vec), mean(garch_aic_vec))
+```
+
+Print the metrics data frame.
+
+```{r, eval=TRUE}
+metrics_df
+```
+
+Overall model performance comparison using RMSE.
+
+```{r, eval=TRUE}
+# RMSE
+vectors <- list(arima_rmse, reg_rmse, hav_rmse, garch_rmse)
+names(vectors) <- c("ARIMA", "Linear Regression", "HAV-RV", "ARMA-GARCH")
+# Calculate means for each vector
+vector_means <- sapply(vectors, mean)
+# Identify the index of the lowest mean
+lowest_mean_idx <- which.min(vector_means)
+boxplot(vectors, 
+          names = names(vectors), 
+          main = ("Models performance Comparison (RMSE)"), 
+          col = ifelse(names(vectors) == names(vectors)[lowest_mean_idx], "red", "gray"),
+          ylab = "RMSE",
+          outline = FALSE)
+
+```
+
+Overall model performance comparison using QLIKE.
+
+```{r, eval=TRUE}
+# QLIKE
+vectors <- list(arima_qlike, reg_qlike, hav_qlike, garch_qlike)
+names(vectors) <- c("ARIMA", "Linear Regression", "HAV-RV", "ARMA-GARCH")
+# Calculate means for each vector
+vector_means <- sapply(vectors, mean)
+# Identify the index of the lowest mean
+lowest_mean_idx <- which.min(vector_means)
+boxplot(vectors, 
+          names = names(vectors), 
+          main = ("Models performance Comparison (QLIKE)"), 
+          col = ifelse(names(vectors) == names(vectors)[lowest_mean_idx], "red", "gray"),
+          ylab = "QLIKE",
+          outline = FALSE)
+```
